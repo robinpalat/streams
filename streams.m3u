@@ -47,3 +47,9 @@ http://200.7.99.59:8000/play/a0gm/index.m3u8
 http://72.1.184.5:8089/play/a05i/index.m3u8
 #EXTINF:-1, Historia (1080p)
 https://d1k3vzh2ivy22k.cloudfront.net/Historia.m3u8
+#EXTINF:-1, Euronews Spanish (1080p)
+https://iptv.bitred.cl/euronews/index.m3u8
+#EXTINF:-1, Europa Europa (1080p)
+https://iptv.bitred.cl/EUROPAEUROPA_HD/index.m3u8
+#EXTINF:-1, TVE Internacional Europe HD (1080p) [Geo-blocked]
+https://rtvelivestream-rtveplayplus.rtve.es/rtvesec/int/tvei_eu_main_1080.m3u8
