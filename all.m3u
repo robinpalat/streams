@@ -4731,3 +4731,5 @@ https://tv3.bitstreaming.net:3680/live/zuracatvlive.m3u8
 https://videoserver.tmcreativos.com:19360/gesfnvpamn/gesfnvpamn.m3u8
 #EXTINF:-1,24 Horas Chile
 http://187.102.208.209:8000/play/a0a1/index.m3u8
+#EXTINF:-1,ABC Autralia
+https://abc-news-dmd-streams-1.akamaized.net/out/v1/701126012d044971b3fa89406a440133/index.m3u8
