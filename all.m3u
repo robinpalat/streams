@@ -4729,3 +4729,5 @@ http://45.70.201.81:8000/play/a00u/index.m3u8
 https://tv3.bitstreaming.net:3680/live/zuracatvlive.m3u8
 #EXTINF:0,Zurqui TV (720p)
 https://videoserver.tmcreativos.com:19360/gesfnvpamn/gesfnvpamn.m3u8
+#EXTINF:-1,24 Horas Chile
+http://187.102.208.209:8000/play/a0a1/index.m3u8
