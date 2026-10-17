@@ -5,11 +5,29 @@
 # Dependencias: yad, git (opcional). Opcionales: vlc (o $PLAYER), xclip / wl-paste.
 # Si los archivos están dentro de un repositorio git, al guardar hace commit y push
 # automáticamente (así se publica en GitHub). Necesita git con credenciales ya configuradas.
+# Al guardar, prueba cada stream de streams.m3u (necesita curl) y elimina de esa lista, sin
+# preguntar, los que no responden. all.m3u no se toca. Ajustes (variables de entorno):
+#   CHECK_ONLINE=0 desactiva la prueba · CHECK_TIMEOUT=10 segundos por intento
+#   CHECK_JOBS=16 pruebas en paralelo · CHECK_HOST=https://github.com (para detectar si hay red)
+# Lista grande "en vivo": el script solo guarda la URL (ALL_URL) y la descarga cada vez que abres
+# el editor, o con el botón "Actualizar lista". La copia local es una caché; en ese modo la lista
+# grande es de solo lectura y solo se guarda y publica streams.m3u.
+#   ALL_URL=""  usa el archivo local all.m3u sin descargar (modo anterior)
+#   ALL_REFRESH=0  no descarga al abrir (para trabajar sin conexión)
 
-ALL_FILE="${1:-${ALL_FILE:-$HOME/streams/all.m3u}}"
+ALL_URL="${ALL_URL-https://iptv-org.github.io/iptv/languages/spa.m3u}"
+ALL_REFRESH="${ALL_REFRESH:-1}"
+LIVE=0; [[ -n $ALL_URL ]] && LIVE=1
+if ((LIVE)); then ALL_DEFAULT="${XDG_CACHE_HOME:-$HOME/.cache}/streams-editor/all.m3u"
+else ALL_DEFAULT="$HOME/streams/all.m3u"; fi
+ALL_FILE="${1:-${ALL_FILE:-$ALL_DEFAULT}}"
 FAV_FILE="${2:-${FAV_FILE:-$HOME/streams/streams.m3u}}"
 PLAYER="${PLAYER:-vlc}"
 TITLE="Editor de streams"
+CHECK_ONLINE="${CHECK_ONLINE:-1}"
+CHECK_TIMEOUT="${CHECK_TIMEOUT:-10}"
+CHECK_JOBS="${CHECK_JOBS:-16}"
+CHECK_HOST="${CHECK_HOST:-https://github.com}"
 
 # Línea #EXTINF: grupo 1 = cabecera hasta la coma que separa el nombre, grupo 3 = nombre.
 # Respeta comas dentro de atributos entre comillas (tvg-logo="...", group-title="...").
@@ -23,6 +41,7 @@ vis=()          # índices que se muestran ahora
 filter=""       # texto del buscador; vacío = mostrar todo
 fwords=()       # palabras del filtro (en minúsculas)
 status=""       # mensaje de una sola vez para la cabecera
+report=""       # resultado de la prueba online (se muestra al terminar de guardar)
 
 trim() {  # sin subshell: resultado en $REPLY
   REPLY=$1
@@ -81,17 +100,60 @@ rename_block() {
   REPLY=$out
 }
 
-# write_m3u ARCHIVO CABECERA ARRAY_NOMBRES ARRAY_URLS ARRAY_BLOQUES
+# Descarga ALL_URL a ALL_FILE (la caché). Solo reemplaza la copia si lo descargado es una lista M3U válida.
+refresh_all() {
+  local tmp n
+  command -v curl >/dev/null || { status="No se pudo actualizar la lista: falta curl."; return 1; }
+  mkdir -p "$(dirname "$ALL_FILE")" || return 1
+  tmp=$(mktemp) || return 1
+  if curl -fsSL -m 30 --connect-timeout 10 -o "$tmp" "$ALL_URL" 2>/dev/null \
+     && head -c 64 "$tmp" | grep -q '^#EXTM3U' && grep -q '^#EXTINF' "$tmp"; then
+    chmod 644 "$tmp" && mv -f "$tmp" "$ALL_FILE"
+    n=$(grep -c '^#EXTINF' "$ALL_FILE")
+    status="Lista actualizada desde la URL: $n canales."
+    return 0
+  fi
+  rm -f "$tmp"
+  if [[ -f $ALL_FILE ]]; then
+    status="No se pudo descargar la lista (¿sin conexión?). Se usa la copia local del $(date -r "$ALL_FILE" '+%F %H:%M')."
+  else
+    status="No se pudo descargar la lista y no hay copia local."
+  fi
+  return 1
+}
+
+load_all() {
+  load_file "$ALL_FILE"
+  A_names=("${LF_names[@]}"); A_urls=("${LF_urls[@]}"); A_blocks=("${LF_blocks[@]}"); A_head=$LF_head
+}
+
+# Botón "Actualizar lista": descarga de nuevo y recarga la lista grande.
+reload_all() {
+  refresh_all
+  load_all
+  [[ $VIEW == all ]] && unstash
+  filter=""
+}
+
+# write_m3u ARCHIVO CABECERA ARRAY_NOMBRES ARRAY_URLS ARRAY_BLOQUES [plain]
+# Modo normal: conserva cada entrada tal cual (atributos, tvg-logo...).
+# Modo "plain": escribe "#EXTINF:-1, Nombre" sin atributos (sin tvg-logo); solo se
+#   conservan líneas auxiliares como #EXTVLCOPT, necesarias para reproducir.
 # Si el contenido no cambió, no toca el archivo (no genera commits vacíos).
 write_m3u() {
-  local file=$1 head=$2 tmp i
+  local file=$1 head=$2 mode=${6:-} tmp i l
   local -n _wn=$3 _wu=$4 _wb=$5
   mkdir -p "$(dirname "$file")" || return 1
   tmp=$(mktemp) || return 1
   {
-    printf '%s\n' "${head:-#EXTM3U}"
+    if [[ $mode == plain ]]; then printf '#EXTM3U\n'; else printf '%s\n' "${head:-#EXTM3U}"; fi
     for i in "${!_wu[@]}"; do
-      if [[ ${_wb[i]} == *"#EXTINF:"* ]]; then
+      if [[ $mode == plain ]]; then
+        printf '#EXTINF:-1, %s\n' "${_wn[i]}"
+        while IFS= read -r l; do
+          [[ -n $l && $l != "#EXTINF:"* ]] && printf '%s\n' "$l"
+        done <<< "${_wb[i]}"
+      elif [[ ${_wb[i]} == *"#EXTINF:"* ]]; then
         printf '%s\n' "${_wb[i]}"
       else
         [[ -n ${_wb[i]} ]] && printf '%s\n' "${_wb[i]}"
@@ -106,14 +168,15 @@ write_m3u() {
 
 save_all() {  # guarda las dos listas
   stash
-  write_m3u "$ALL_FILE" "$A_head" A_names A_urls A_blocks || return 1
-  write_m3u "$FAV_FILE" "$F_head" F_names F_urls F_blocks
+  if ((!LIVE)); then write_m3u "$ALL_FILE" "$A_head" A_names A_urls A_blocks || return 1; fi
+  write_m3u "$FAV_FILE" "" F_names F_urls F_blocks plain   # mi playlist: formato simple, sin tvg-logo
 }
 
 # commit (si hay cambios) + push de cada archivo que esté en un repo git.
 publish() {
-  local f dir
-  for f in "$ALL_FILE" "$FAV_FILE"; do
+  local f dir files=("$ALL_FILE" "$FAV_FILE")
+  ((LIVE)) && files=("$FAV_FILE")
+  for f in "${files[@]}"; do
     dir=$(dirname "$f")
     git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || continue
     git -C "$dir" add -- "$f" || return 1
@@ -122,6 +185,107 @@ publish() {
     fi
     git -C "$dir" push -q || return 1
   done
+}
+
+# ---------- prueba online ----------
+# probe_stream URL BLOQUE ARCHIVO_TEMP  ->  0 si el stream responde, 1 si no.
+# Respeta #EXTVLCOPT http-user-agent / http-referrer. Dos intentos antes de darlo por caído.
+# Un timeout con datos ya recibidos (un directo que sigue fluyendo) cuenta como "online".
+probe_stream() {
+  local url=$1 blk=$2 tmpf=$3 ua="VLC/3.0.20 LibVLC/3.0.20" ref="" l code attempt
+  while IFS= read -r l; do
+    case $l in
+      "#EXTVLCOPT:http-user-agent="*) ua=${l#*=} ;;
+      "#EXTVLCOPT:http-referrer="*|"#EXTVLCOPT:http-referer="*) ref=${l#*=} ;;
+    esac
+  done <<< "$blk"
+  local args=(-sL -m "$CHECK_TIMEOUT" --connect-timeout 6 -A "$ua" -r 0-2047 -o "$tmpf" -w '%{http_code}')
+  [[ -n $ref ]] && args+=(-e "$ref")
+  for attempt in 1 2; do
+    code=$(curl "${args[@]}" "$url" 2>/dev/null)
+    if [[ $code == 200 || $code == 206 ]]; then
+      # una página HTML con código 200 suele ser un mensaje de error, no un stream
+      head -c 512 "$tmpf" 2>/dev/null | grep -aqiE '<!doctype|<html' || return 0
+    fi
+    ((attempt==1)) && sleep 2
+  done
+  return 1
+}
+
+# Quita de mi playlist (F_*) los streams que no responden. No pregunta nada.
+# Sin red, cancelada, o si fallan TODOS, no elimina nada (para no vaciar la lista por un problema de red).
+prune_offline() {
+  report=""
+  [[ $CHECK_ONLINE == 1 ]] || return 0
+  stash
+  local total=${#F_urls[@]} tmpd i n pid
+  ((total)) || return 0
+  command -v curl >/dev/null || { report="No se comprobaron los streams: falta curl."; return 0; }
+  if ! curl -sI -m 8 "$CHECK_HOST" >/dev/null 2>&1; then
+    report="Sin conexión a internet: se omitió la comprobación y no se eliminó ningún stream."
+    return 0
+  fi
+
+  tmpd=$(mktemp -d) || return 0
+  (
+    for i in "${!F_urls[@]}"; do
+      while (($(jobs -rp | wc -l) >= CHECK_JOBS)); do wait -n; done
+      (
+        if probe_stream "${F_urls[i]}" "${F_blocks[i]}" "$tmpd/$i.body"; then echo OK; else echo FAIL; fi > "$tmpd/$i.tmp"
+        rm -f "$tmpd/$i.body"; mv -f "$tmpd/$i.tmp" "$tmpd/$i.res"
+      ) &
+    done
+    wait
+  ) &
+  pid=$!
+
+  {
+    while :; do
+      n=$(find "$tmpd" -maxdepth 1 -name '*.res' | wc -l)
+      echo $((n*100/total)); echo "# Comprobando streams: $n de $total"
+      ((n>=total)) && break
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.3
+    done
+  } | yad --progress --auto-close --no-buttons --center --width=440 \
+          --title="Comprobando streams" --text="Comprobando streams…"
+
+  n=$(find "$tmpd" -maxdepth 1 -name '*.res' | wc -l)
+  if ((n < total)); then   # ventana cerrada antes de terminar
+    kill "$pid" 2>/dev/null
+    rm -rf "$tmpd"
+    report="Comprobación interrumpida: no se eliminó ningún stream."
+    return 0
+  fi
+
+  local -A isdead=(); local ndead=0
+  for i in "${!F_urls[@]}"; do
+    if [[ $(<"$tmpd/$i.res") == FAIL ]]; then isdead[$i]=1; ndead=$((ndead+1)); fi
+  done
+  rm -rf "$tmpd"
+
+  ((ndead)) || return 0
+  if ((ndead == total)); then
+    report="Ningún stream respondió (¿problema de red?): no se eliminó ninguno."
+    return 0
+  fi
+
+  local nn=() nu=() nb=() gone=()
+  for i in "${!F_urls[@]}"; do
+    if [[ -n ${isdead[$i]} ]]; then gone+=("${F_names[i]}")
+    else nn+=("${F_names[i]}"); nu+=("${F_urls[i]}"); nb+=("${F_blocks[i]}"); fi
+  done
+  F_names=("${nn[@]}"); F_urls=("${nu[@]}"); F_blocks=("${nb[@]}")
+  [[ $VIEW == fav ]] && unstash
+
+  if ((ndead == 1)); then report="Se eliminó 1 stream sin conexión de mi playlist:"
+  else report="Se eliminaron $ndead streams sin conexión de mi playlist:"; fi
+  for ((i=0; i<${#gone[@]} && i<15; i++)); do report+=$'\n'"• ${gone[i]}"; done
+  ((${#gone[@]} > 15)) && report+=$'\n'"… y $((${#gone[@]}-15)) más"
+}
+
+show_report() {
+  yad --info --center --width=480 --timeout=20 --text="$(esc "$report")" --button="OK:0"
 }
 
 # ---------- cambio de lista ----------
@@ -210,12 +374,18 @@ add_entry() {
   IFS='|' read -r n u _ <<< "$res"
   trim "$n"; n=$REPLY; trim "$u"; u=$REPLY
   [[ -z $u ]] && return
+  if ((LIVE)) && [[ $VIEW == all ]]; then   # la lista grande es de solo lectura: va a mi playlist
+    F_names+=("${n:-$u}"); F_urls+=("$u"); F_blocks+=("")
+    status="Añadido a mi playlist: ${n:-$u}"
+    return
+  fi
   names+=("${n:-$u}"); urls+=("$u"); blocks+=("")
   trim "${n:-$u}"
   matches "$REPLY" "$u" || filter=""   # que la nueva fila no quede oculta
 }
 
 delete_marked() {
+  ((LIVE)) && [[ $VIEW == all ]] && return   # lista grande en vivo: solo lectura
   local i nn=() nu=() nb=()
   for i in "${!urls[@]}"; do
     [[ ${marks[i]} == TRUE ]] && continue
@@ -269,9 +439,10 @@ sort_by_name() {
 # ---------- bucle principal ----------
 main() {
   command -v yad >/dev/null || { echo "Falta yad" >&2; exit 1; }
-  local rows i out rc info cur label btns err
+  local rows i out rc info cur label btns err edit
 
-  load_file "$ALL_FILE"; A_names=("${LF_names[@]}"); A_urls=("${LF_urls[@]}"); A_blocks=("${LF_blocks[@]}"); A_head=$LF_head
+  if ((LIVE)) && [[ $ALL_REFRESH == 1 ]]; then refresh_all; fi
+  load_all
   load_file "$FAV_FILE"; F_names=("${LF_names[@]}"); F_urls=("${LF_urls[@]}"); F_blocks=("${LF_blocks[@]}"); F_head=$LF_head
   VIEW=all; unstash
 
@@ -282,12 +453,19 @@ main() {
       rows+=("${marks[i]:-FALSE}" "${names[i]}")
     done
 
+    edit=(--editable --editable-cols=2)
     if [[ $VIEW == all ]]; then
-      cur=$ALL_FILE; label="Todos los streams"
-      info=""
+      label="Todos los streams"
+      if ((LIVE)); then
+        cur="$ALL_URL — actualizada $(date -r "$ALL_FILE" '+%F %H:%M' 2>/dev/null)"; edit=()
+        info="Lista en vivo, de solo lectura. Marca streams y pulsa «A mi playlist»."
+      else
+        cur=$ALL_FILE
+        info="Marca streams y pulsa «A mi playlist». Doble clic en un nombre para editarlo."
+      fi
     else
       cur=$FAV_FILE; label="Mi playlist"
-      info="Doble clic en un nombre para editarlo. «Guardar» publica los cambios."
+      info="Doble clic en un nombre para editarlo. «Guardar» elimina los streams offline y publica."
     fi
     if [[ -n $filter ]]; then
       info="<b>Filtro: «$(esc "$filter")»</b> — mostrando ${#vis[@]} de ${#urls[@]}\n$info"
@@ -301,11 +479,12 @@ main() {
     if [[ $VIEW == all ]]; then
       btns+=(--button="A mi playlist!emblem-favorite:20"
              --button="Mi playlist (${#F_urls[@]})!go-next:21")
+      ((LIVE)) && btns+=(--button="Actualizar lista!view-refresh:30")
     else
       btns+=(--button="Todos los streams (${#A_urls[@]})!go-previous:21")
     fi
-    btns+=(--button="Borrar!edit-delete:11"
-           --button="Reproducir!media-playback-start:12"
+    ((LIVE)) && [[ $VIEW == all ]] || btns+=(--button="Borrar!edit-delete:11")
+    btns+=(--button="Reproducir!media-playback-start:12"
            --button="A-Z!view-sort-ascending:13"
            --button="Cancelar!window-close:1"
            --button="Guardar!document-save:0")
@@ -313,9 +492,9 @@ main() {
     # Las filas van por stdin (sirve para listas muy grandes).
     out=$({ ((${#rows[@]})) && printf '%s\n' "${rows[@]}"; } | \
       yad --list --title="$TITLE — $label" --center --width=900 --height=600 \
-      --text="$label — ${#urls[@]} streams\n\n" \
+      --text="<b>$label</b> — ${#urls[@]} streams\n<small>$(esc "$cur")</small>\n$info" \
       --column="Marcar":CHK --column="Nombre" \
-      --editable --editable-cols=2 --print-all --separator='|' \
+      "${edit[@]}" --print-all --separator='|' \
       --no-markup --search-column=2 \
       "${btns[@]}")
     rc=$?
@@ -323,10 +502,15 @@ main() {
     [[ -n $out ]] && merge_list "$out"
 
     case $rc in
-      0)  if save_all; then
-            if err=$(publish 2>&1); then exit 0
-            else yad --error --center --width=500 \
-                   --text="Se guardaron los archivos, pero falló la publicación en git:\n\n$(esc "$err")"
+      0)  prune_offline
+          if save_all; then
+            if err=$(publish 2>&1); then
+              [[ -n $report ]] && show_report
+              exit 0
+            else
+              yad --error --center --width=500 \
+                  --text="Se guardaron los archivos, pero falló la publicación en git:\n\n$(esc "$err")"
+              status=$report
             fi
           else yad --error --center --text="No se pudo guardar en:\n$ALL_FILE\n$FAV_FILE"; fi ;;
       10) add_entry ;;
@@ -337,6 +521,7 @@ main() {
       15) filter=""; marks=() ;;
       20) [[ $VIEW == all ]] && add_to_fav ;;
       21) switch_view ;;
+      30) ((LIVE)) && [[ $VIEW == all ]] && reload_all ;;
       *)  yad --question --center --text="¿Salir sin guardar los cambios?" \
             --button="Seguir editando:1" --button="Salir:0" && exit 0 ;;
     esac
