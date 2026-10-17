@@ -23,9 +23,13 @@
   #menuBtn .burger { font-size:20px; line-height:1; }
   #menuBtn .title { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
-  #fsBtn { position:fixed; top:8px; right:8px; z-index:5; background:rgba(0,0,0,.55); color:var(--fg); border:0; border-radius:8px;
-    padding:8px 12px; font:inherit; font-size:20px; line-height:1; cursor:pointer; transition:opacity .4s; }
-  #fsBtn.hide { opacity:0; pointer-events:none; }
+  #topRight { position:fixed; top:8px; right:8px; z-index:5; display:flex; gap:8px; align-items:center; transition:opacity .4s; }
+  #topRight.hide { opacity:0; pointer-events:none; }
+  #topRight button { background:rgba(0,0,0,.55); border:0; border-radius:8px; padding:8px 12px; font-size:18px; line-height:1; }
+  #topRight google-cast-launcher { display:none; width:24px; height:24px; padding:8px; background:rgba(0,0,0,.55);
+    border-radius:8px; cursor:pointer; --connected-color:#4da3ff; --disconnected-color:#eeeeee; }
+  #castdlg menu { flex-wrap:wrap; justify-content:flex-start; }
+  #castdlg menu button { flex:1 1 100%; }
   #panel { position:fixed; inset:0; z-index:10; background:rgba(0,0,0,.88); display:none; flex-direction:column; }
   #panel.open { display:flex; }
   .top { display:flex; align-items:center; gap:6px; padding:8px; border-bottom:1px solid var(--bd); }
@@ -64,7 +68,21 @@
 
 <button id="menuBtn" aria-label="Abrir lista"><span class="burger">☰</span><span class="title" id="title">Streams</span></button>
 
-<button id="fsBtn" aria-label="Pantalla completa" title="Pantalla completa (F)">⛶</button>
+<div id="topRight">
+  <google-cast-launcher id="castBtn" title="Enviar a Chromecast / Google TV"></google-cast-launcher>
+  <button id="tvBtn" aria-label="Enviar al Roku" title="Enviar este canal al Roku">Roku</button>
+  <button id="fsBtn" aria-label="Pantalla completa" title="Pantalla completa (F)">⛶</button>
+</div>
+
+<dialog id="castdlg">
+  <strong>Enviar al Roku</strong>
+  <label for="rip">IP del Roku</label>
+  <input id="rip" placeholder="192.168.1.50" inputmode="decimal">
+  <menu>
+    <button id="toRoku">Enviar al Roku</button>
+    <button id="castClose">Cerrar</button>
+  </menu>
+</dialog>
 
 <div id="panel">
   <div class="top">
@@ -127,6 +145,7 @@
   let temp = null;          // canal no favorito visto, incluido temporalmente al zapear
   let current = null;       // canal en reproducción (para reintentos)
   let retries = 0, retryT = null, waitT = null;
+  let castActive = false;   // hay una sesión de Cast abierta: los canales se envían a la tele
 
   function load() {
     try {
@@ -148,11 +167,13 @@
 
   let hideT;
   const fsBtn = $('fsBtn');
+  const tvBtn = $('tvBtn');
+  const topRight = $('topRight');
   function poke() {
-    menuBtn.classList.remove('hide'); fsBtn.classList.remove('hide');
+    menuBtn.classList.remove('hide'); topRight.classList.remove('hide');
     clearTimeout(hideT);
     hideT = setTimeout(() => {
-      if (!panel.classList.contains('open') && !video.paused) { menuBtn.classList.add('hide'); fsBtn.classList.add('hide'); }
+      if (!panel.classList.contains('open') && !video.paused) { menuBtn.classList.add('hide'); topRight.classList.add('hide'); }
     }, 3500);
   }
   ['mousemove', 'touchstart', 'keydown', 'click'].forEach(e => document.addEventListener(e, poke, { passive: true }));
@@ -176,6 +197,100 @@
       document.exitFullscreen().then(() => root.requestFullscreen()).catch(() => {});
     }
   });
+
+  /* ---------- enviar a la TV: Roku (ECP) y Chromecast / Android TV (Google Cast) ---------- */
+  const castDlg = $('castdlg');
+  const rokuIp = () => { try { return localStorage.getItem('streams.roku') || ''; } catch (e) { return ''; } };
+
+  function note(text) {
+    $('title').textContent = text;
+    menuBtn.classList.remove('hide');
+    setTimeout(() => { if (current && !retries) $('title').textContent = current.name; }, 4500);
+  }
+
+  function openCast() {
+    if (!current) { note('Primero elige un canal'); return; }
+    $('rip').value = rokuIp();
+    castDlg.showModal();
+  }
+  tvBtn.onclick = openCast;
+  $('castClose').onclick = () => castDlg.close();
+
+  // --- Roku: protocolo de control por red (puerto 8060), solo desde páginas http o localhost
+  async function sendRoku() {
+    const ip = $('rip').value.trim();
+    if (!ip) { $('rip').focus(); return; }
+    try { localStorage.setItem('streams.roku', ip); } catch (e) {}
+    castDlg.close();
+    const url = 'http://' + ip + ':8060/launch/dev?contentId=' + encodeURIComponent(current.url) +
+                '&mediaType=live&name=' + encodeURIComponent(current.name);
+    if (location.protocol === 'https:') {
+      // el navegador bloquea peticiones http desde una página https: dejamos el comando listo
+      const cmd = "curl -d '' '" + url.replace(/'/g, '%27') + "'";
+      try { await navigator.clipboard.writeText(cmd); note('Página HTTPS: comando curl copiado'); }
+      catch (e) { note('Página HTTPS: el navegador bloquea el envío al Roku'); }
+      return;
+    }
+    try {
+      await fetch(url, { method: 'POST', mode: 'no-cors' });
+      video.pause();
+      note('Enviado al Roku (' + ip + ')');
+    } catch (e) {
+      note('No se pudo contactar con el Roku en ' + ip);
+    }
+  }
+  $('toRoku').onclick = sendRoku;
+
+  // --- Chromecast / Google TV: Google Cast (Chrome o Edge, página HTTPS o localhost)
+  let castOk = false;
+  function castMime(u) {
+    const l = u.toLowerCase();
+    if (l.includes('.mp4')) return 'video/mp4';
+    if (l.includes('.mp3')) return 'audio/mpeg';
+    return 'application/x-mpegURL';
+  }
+  async function castLoad(c) {
+    const sess = cast.framework.CastContext.getInstance().getCurrentSession();
+    if (!sess || !c) return;
+    const mime = castMime(c.url);
+    const mi = new chrome.cast.media.MediaInfo(c.url, mime);
+    mi.streamType = mime === 'application/x-mpegURL' ? chrome.cast.media.StreamType.LIVE : chrome.cast.media.StreamType.BUFFERED;
+    mi.metadata = new chrome.cast.media.GenericMediaMetadata();
+    mi.metadata.title = c.name;
+    const err = await sess.loadMedia(new chrome.cast.media.LoadRequest(mi));
+    if (err) note('La TV no pudo reproducir este canal (' + err + ')');
+    else note('En la TV: ' + c.name);
+  }
+  function onCastSession(e) {
+    const S = cast.framework.SessionState;
+    if (e.sessionState === S.SESSION_STARTED || e.sessionState === S.SESSION_RESUMED) {
+      castActive = true;
+      clearTimers();
+      video.pause();
+      if (current) castLoad(current);
+    } else if (e.sessionState === S.SESSION_ENDED) {
+      castActive = false;
+      note('Cast terminado');
+      if (current) play(current, true, true);   // vuelve a reproducir aquí el canal actual
+    }
+  }
+  window.__onGCastApiAvailable = ok => {
+    if (!ok) return;
+    const ctx = cast.framework.CastContext.getInstance();
+    ctx.setOptions({
+      receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
+      autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
+    });
+    ctx.addEventListener(cast.framework.CastContextEventType.SESSION_STATE_CHANGED, onCastSession);
+    castOk = true;
+    $('castBtn').style.display = 'inline-block';   // el icono oficial solo aparece si Cast está disponible
+  };
+  if (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+    const sc = document.createElement('script');
+    sc.src = 'https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1';
+    sc.async = true;
+    document.head.appendChild(sc);
+  }
 
   $('tabList').onclick = () => setTab('list');
   $('tabFav').onclick = () => setTab('fav');
@@ -365,7 +480,7 @@
   }
 
   document.addEventListener('keydown', e => {
-    if (panel.classList.contains('open') || dlg.open) return;
+    if (panel.classList.contains('open') || dlg.open || castDlg.open) return;
     const t = e.target;
     if (t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) return;
     if (e.key === 'f' || e.key === 'F') { toggleFs(); return; }
@@ -404,6 +519,7 @@
     state.last[cur().id] = c.url; save();
     if (!isRetry) $('title').textContent = c.name;
     if (hls) { hls.destroy(); hls = null; }
+    if (castActive) { video.pause(); castLoad(c); if (!quiet) renderList(); poke(); return; }
     if (/\.m3u8(\?|$)/i.test(c.url) && window.Hls && Hls.isSupported()) {
       hls = new Hls();
       hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) onFail(); });
