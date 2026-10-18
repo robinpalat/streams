@@ -1,5 +1,5 @@
 // Sube el número de versión cuando actualices index.html
-const CACHE = 'streams-v6';
+const CACHE = 'streams-v7';
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {

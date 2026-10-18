@@ -28,6 +28,7 @@
   #topRight button { background:rgba(0,0,0,.55); border:0; border-radius:8px; padding:8px 12px; font-size:18px; line-height:1; }
   #topRight google-cast-launcher { display:none; width:24px; height:24px; padding:8px; background:rgba(0,0,0,.55);
     border-radius:8px; cursor:pointer; --connected-color:#4da3ff; --disconnected-color:#eeeeee; }
+  #castdlg p { color:var(--mut); font-size:13px; margin:8px 0; line-height:1.4; }
   #castdlg menu { flex-wrap:wrap; justify-content:flex-start; }
   #castdlg menu button { flex:1 1 100%; }
   #panel { position:fixed; inset:0; z-index:10; background:rgba(0,0,0,.88); display:none; flex-direction:column; }
@@ -70,14 +71,16 @@
 
 <div id="topRight">
   <google-cast-launcher id="castBtn" title="Enviar a Chromecast / Google TV"></google-cast-launcher>
-  <button id="tvBtn" aria-label="Enviar al Roku" title="Enviar este canal al Roku">Roku</button>
+  <button id="tvBtn" aria-label="Enviar a la TV" title="Enviar a la TV: estado de Cast y Roku">📺</button>
   <button id="fsBtn" aria-label="Pantalla completa" title="Pantalla completa (F)">⛶</button>
 </div>
 
 <dialog id="castdlg">
-  <strong>Enviar al Roku</strong>
+  <strong>Enviar a la TV</strong>
+  <p id="castInfo"></p>
   <label for="rip">IP del Roku</label>
   <input id="rip" placeholder="192.168.1.50" inputmode="decimal">
+  <p id="rokuInfo"></p>
   <menu>
     <button id="toRoku">Enviar al Roku</button>
     <button id="castClose">Cerrar</button>
@@ -209,7 +212,12 @@
   }
 
   function openCast() {
-    if (!current) { note('Primero elige un canal'); return; }
+    $('castInfo').textContent = castOk
+      ? 'Chromecast / Google TV: usa el icono de Cast de arriba a la derecha.'
+      : 'Chromecast / Google TV no disponible: ' + castWhy;
+    $('rokuInfo').textContent = location.protocol === 'https:'
+      ? 'Desde una página HTTPS el navegador bloquea el envío directo al Roku (solo copia un comando curl). Para enviar al Roku abre esta página por HTTP en tu red.'
+      : 'Se envía por la red local al canal Streams del Roku.';
     $('rip').value = rokuIp();
     castDlg.showModal();
   }
@@ -218,6 +226,7 @@
 
   // --- Roku: protocolo de control por red (puerto 8060), solo desde páginas http o localhost
   async function sendRoku() {
+    if (!current) { castDlg.close(); note('Primero elige un canal'); return; }
     const ip = $('rip').value.trim();
     if (!ip) { $('rip').focus(); return; }
     try { localStorage.setItem('streams.roku', ip); } catch (e) {}
@@ -243,6 +252,10 @@
 
   // --- Chromecast / Google TV: Google Cast (Chrome o Edge, página HTTPS o localhost)
   let castOk = false;
+  const standalone = window.matchMedia && matchMedia('(display-mode: standalone)').matches;
+  let castWhy = (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+    ? 'todavía cargando el SDK de Google Cast (o bloqueado en este navegador).'
+    : 'la página no se abrió por HTTPS (ahora es ' + location.protocol + '//' + location.host + ').';
   function castMime(u) {
     const l = u.toLowerCase();
     if (l.includes('.mp4')) return 'video/mp4';
@@ -275,7 +288,12 @@
     }
   }
   window.__onGCastApiAvailable = ok => {
-    if (!ok) return;
+    if (!ok) {
+      castWhy = standalone
+        ? 'estás en la app instalada, que no ofrece Cast. Abre la página en una pestaña de Chrome.'
+        : 'este navegador no ofrece Cast. Usa Chrome (el navegador de Xiaomi no lo tiene).';
+      return;
+    }
     const ctx = cast.framework.CastContext.getInstance();
     ctx.setOptions({
       receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
@@ -289,6 +307,7 @@
     const sc = document.createElement('script');
     sc.src = 'https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1';
     sc.async = true;
+    sc.onerror = () => { castWhy = 'no se pudo cargar el SDK de Cast (sin internet o bloqueado).'; };
     document.head.appendChild(sc);
   }
 
