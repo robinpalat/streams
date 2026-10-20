@@ -26,8 +26,9 @@
   #topRight { position:fixed; top:8px; right:8px; z-index:5; display:flex; gap:8px; align-items:center; transition:opacity .4s; }
   #topRight.hide { opacity:0; pointer-events:none; }
   #topRight button { background:rgba(0,0,0,.55); border:0; border-radius:8px; padding:8px 12px; font-size:18px; line-height:1; }
-  #topRight google-cast-launcher { display:none; width:24px; height:24px; padding:8px; background:rgba(0,0,0,.55);
-    border-radius:8px; cursor:pointer; --connected-color:#4da3ff; --disconnected-color:#eeeeee; }
+  #topRight button svg { display:block; }
+  #castBtn.dim { opacity:.5; }
+  #castBtn.on { color:#4da3ff; }
   #castdlg p { color:var(--mut); font-size:13px; margin:8px 0; line-height:1.4; }
   #castdlg menu { flex-wrap:wrap; justify-content:flex-start; }
   #castdlg menu button { flex:1 1 100%; }
@@ -70,7 +71,7 @@
 <button id="menuBtn" aria-label="Abrir lista"><span class="burger">☰</span><span class="title" id="title">Streams</span></button>
 
 <div id="topRight">
-  <google-cast-launcher id="castBtn" title="Enviar a Chromecast / Google TV"></google-cast-launcher>
+  <button id="castBtn" class="dim" aria-label="Enviar a Chromecast / Google TV" title="Enviar a Chromecast / Google TV"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M1 18v3h3c0-1.66-1.34-3-3-3zm0-4v2c2.76 0 5 2.24 5 5h2c0-3.87-3.13-7-7-7zm0-4v2c4.97 0 9 4.03 9 9h2c0-6.08-4.93-11-11-11zm20-7H3c-1.1 0-2 .9-2 2v3h2V5h18v14h-7v2h7c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z"/></svg></button>
   <button id="tvBtn" aria-label="Enviar a la TV" title="Enviar a la TV: estado de Cast y Roku">📺</button>
   <button id="fsBtn" aria-label="Pantalla completa" title="Pantalla completa (F)">⛶</button>
 </div>
@@ -81,7 +82,7 @@
   <label for="rip">IP del Roku</label>
   <input id="rip" placeholder="192.168.1.50" inputmode="decimal">
   <p id="rokuInfo"></p>
-  <p>Versión de la página: 8</p>
+  <p>Versión de la página: 9</p>
   <menu>
     <button id="toRoku">Enviar al Roku</button>
     <button id="castClose">Cerrar</button>
@@ -188,15 +189,25 @@
   const root = document.documentElement;
   const fsEl = () => document.fullscreenElement || document.webkitFullscreenElement;
   if (!(root.requestFullscreen || root.webkitRequestFullscreen)) fsBtn.style.display = 'none';
-  function toggleFs() {
-    if (fsEl()) (document.exitFullscreen || document.webkitExitFullscreen).call(document);
-    else (root.requestFullscreen || root.webkitRequestFullscreen).call(root);
+  function unlockOrientation() {
+    try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (e) {}
+  }
+  async function toggleFs() {
+    if (fsEl()) {
+      unlockOrientation();
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      return;
+    }
+    try { await (root.requestFullscreen || root.webkitRequestFullscreen).call(root); } catch (e) { return; }
+    // en pantalla completa se fuerza el modo horizontal, aunque el móvil tenga bloqueada la rotación
+    try { if (screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape'); } catch (e) {}
   }
   fsBtn.onclick = toggleFs;
   video.addEventListener('dblclick', e => { e.preventDefault(); toggleFs(); });
   // si el navegador igualmente abre el <video> a pantalla completa, lo cambiamos por la de toda la app
   document.addEventListener('fullscreenchange', () => {
     fsBtn.textContent = fsEl() ? '⤡' : '⛶';
+    if (!fsEl()) unlockOrientation();   // al salir, se devuelve el control de la rotación
     if (document.fullscreenElement === video) {
       document.exitFullscreen().then(() => root.requestFullscreen()).catch(() => {});
     }
@@ -257,6 +268,25 @@
   let castWhy = (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')
     ? 'todavía cargando el SDK de Google Cast (o bloqueado en este navegador).'
     : 'la página no se abrió por HTTPS (ahora es ' + location.protocol + '//' + location.host + ').';
+  // aspecto del icono: tenue si no hay dispositivos, azul si está conectado
+  function paintCast() {
+    const b = $('castBtn');
+    if (!castOk) { b.className = 'dim'; return; }
+    const st = cast.framework.CastContext.getInstance().getCastState();
+    const S = cast.framework.CastState;
+    b.className = st === S.CONNECTED ? 'on' : (st === S.NO_DEVICES_AVAILABLE ? 'dim' : '');
+  }
+  async function onCastClick() {
+    if (!castOk) { note('Cast no disponible: ' + castWhy); return; }
+    const ctx = cast.framework.CastContext.getInstance();
+    if (castActive) { ctx.endCurrentSession(true); return; }          // conectado: dejar de enviar
+    const err = await ctx.requestSession();                           // abre el selector de dispositivos de Chrome
+    if (err && err !== 'cancel') { note('Cast: ' + err); return; }
+    if (err === 'cancel' && ctx.getCastState() === cast.framework.CastState.NO_DEVICES_AVAILABLE) {
+      note('No se encontraron dispositivos Cast: misma wifi que la tele, y revisa el permiso de dispositivos cercanos de Chrome.');
+    }
+  }
+  $('castBtn').onclick = onCastClick;
   function castMime(u) {
     const l = u.toLowerCase();
     if (l.includes('.mp4')) return 'video/mp4';
@@ -302,7 +332,8 @@
     });
     ctx.addEventListener(cast.framework.CastContextEventType.SESSION_STATE_CHANGED, onCastSession);
     castOk = true;
-    $('castBtn').style.display = 'inline-block';   // el icono oficial solo aparece si Cast está disponible
+    ctx.addEventListener(cast.framework.CastContextEventType.CAST_STATE_CHANGED, paintCast);
+    paintCast();
   };
   if (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
     const sc = document.createElement('script');
